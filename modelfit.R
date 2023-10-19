@@ -2,36 +2,6 @@
 ### Estimation of the nuclear an cytosolic half life parameters for all genes
 ###
 
-
-
-ODEmodel_nuc <- function(Time, State, Pars) {
-  with(as.list(c(State, Pars)), {
-
-        d_nuc <- mu_function(Time)*efficiency_function(Time) + 
-                nuc * ( - tau_function(Time) - diffusion_function(Time)/vol_nuc - lambdanuc_function(Time) ) +
-                cyt * ( diffusion_function(Time)/vol_cyt )
-
-        return(d_nuc)
-  })
-} # end diffusionmodel
-
-
-ODEmodel_cyt <- function(Time, State, Pars) {
-  with(as.list(c(State, Pars)), {
-
-    d_nuc    <- mu_function(Time)*efficiency_function(Time) + 
-                nuc * ( - tau_function(Time) - diffusion_function(Time)/vol_nuc - lambdanuc_function(Time) ) +
-                cyt * ( diffusion_function(Time)/vol_cyt )
-    
-    d_cyt    <- nuc * ( tau_function(Time) + diffusion_function(Time)/vol_nuc ) +
-                cyt * ( - diffusion_function(Time)/vol_cyt - lambdacyt_function(Time) )
-    
-    return(list(c(d_nuc,d_cyt)))
-  })
-} # end diffusionmodel
-
-
-
 # Define the loss function (a negative log likelihood) for the nuclear compartment
 negloss_nuc = function(param, # param is a vector  with param[1] = nuclear degradation rate
                        tp, # the time points at which the measurements were taken
