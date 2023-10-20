@@ -1,12 +1,52 @@
+# load the library for Metropolis-Hastings sampling
+library(mcmc)
+# load the library for ggplot
+library(ggplot2)
+# load the library for the heatscatter plot
+library(LSD)
+# load the library for DEoptim
+library(DEoptim)
+# load the libraries for parallelization
+library(foreach)
+library(doParallel)
+
 ###
 ### Estimation of the nuclear an cytosolic half life parameters for all genes
 ###
 
+# Define the loss function (a negative log likelihood) for later optimization 
+negloss = function(params,
+                   t1,
+                   traf_nuc,
+                   tot_nuc,
+                   traf_cyt,
+                   tot_cyt){
+  
+  if (any(params <= 0)) return(Inf) # reject impossible parameters
+  if (any(params >= 1)) return(Inf)
+  
+  # Prediction of the nuclear new/total ratio for the given timepoints
+  predict_nuc = 1 - exp(- params[1] * t1)  
+  
+  # Prediciton of the cytosolic new/total ratio for the given timepoints
+  predict_cyt = 1 - ( exp(- params[2] * t1) +
+                        params[2] / (params[2] - params[1]) * (exp(- params[1] * t1) - 
+                                                                 exp(- params[2] * t1)) )
+  if (any(is.na(c(predict_nuc, predict_cyt)))) return(Inf)  # reject impossible outcomes
+  if (any(c(predict_nuc, predict_cyt) < 0)) return(Inf)
+  
+  # - residual sum of squares for the comparison with the asin(sqrt()) transformed,
+  # labeling bias corrected, observed new/total ratios in nucleus resp. cytosol
+  res = - sum( (asin(sqrt(predict_nuc)) - traf_nuc)^2 * 2 * tot_nuc) -
+    sum( (asin(sqrt(predict_cyt)) - traf_cyt)^2 * 2 * tot_cyt)
+  return(-res)
+}
+
 # Define the loss function (a negative log likelihood) for the nuclear compartment
-negloss_nuc = function(param, # param is a vector  with param[1] = nuclear degradation rate
-                       tp, # the time points at which the measurements were taken
-                       traf_nuc, # the transformed time series, asin(sqrt(ratio of nuclear labeled RNA[tp]/nuclear total RNA[tp])) 
-                       tot_nuc){ # the total nuclear amount (assumed to be constant)
+negloss_nuc = function(param,
+                       tp,
+                       traf_nuc,
+                       tot_nuc){
   
   deg_nuc = param[1]           
   if (deg_nuc <= 0) return(Inf) # reject impossible parameters
@@ -144,6 +184,73 @@ doMCMC_cyt = function(timepoints,
   
   # return the final result
   return(res_cyt)
+  
+}
+
+### doMCMC takes the data corresponding to one gene in one experiment 
+### and outputs an MCMC sample of desired size
+doMCMC_2d = function(timepoints,
+                  transformed_nuc,
+                  total_nuc,
+                  transformed_cyt,
+                  total_cyt,
+                  distinct_samples = 10^5,
+                  min_acceptance = 0.15,
+                  max_acceptance = 0.45,
+                  start_scale = 1,
+                  start_params = c(0.008,0.01)){
+  
+  # define the loss function in a way that is suitable for the metrop function
+  # params is a 2-dim parameter vector containing (deg_nuc = lambda_nuc+tau, lambda_cyt)
+  loss = function(params,
+                  t1=timepoints,
+                  traf_nuc=transformed_nuc,
+                  tot_nuc=total_nuc,
+                  traf_cyt=transformed_cyt,
+                  tot_cyt=total_cyt){
+    if (any(params <= 0)) return(-Inf) # reject impossible parameters
+    if (any(params >= 1)) return(-Inf)
+    
+    # prediction of the nuclear new/total ratio for the given timepoints
+    predict_nuc = 1 - exp(- params[1] * t1)  
+    
+    # prediciton of the cytosolic new/total ratio for the given timepoints
+    predict_cyt = 1 - ( exp(- params[2] * t1) +
+                          params[2] / (params[2] - params[1]) * (exp(- params[1] * t1) - 
+                                                                   exp(- params[2] * t1)) ) 
+    if (any(is.na(c(predict_nuc, predict_cyt)))) return(-Inf) # reject impossible outcomes
+    if (any(c(predict_nuc, predict_cyt) < 0)) return(-Inf)
+    
+    # - residual sum of squares for the comparison with the asin(sqrt()) transformed,
+    # labeling bias corrected, observed new/total ratios in nucleus resp. cytosol
+    res = - sum( (asin(sqrt(predict_nuc)) - traf_nuc)^2 * 2 * tot_nuc) -
+      sum( (asin(sqrt(predict_cyt)) - traf_cyt)^2 * 2 * tot_cyt)
+    return(res)
+  }
+  
+  # find a suitable scale for the MCMC proposal function 
+  scale = start_scale
+  res = metrop(loss,initial=start_params,nbatch=10^4,scale=scale)
+  
+  # increase the scale by a factor of 2 if the acceptance rate is too high
+  repeat{
+    if (res$accept < max_acceptance) break()
+    scale = scale * 2
+    res = metrop(res,nbatch=10^4,scale=scale)    
+  }
+  # decrease the scale by a factor of 2 if the acceptance rate is too low
+  repeat{
+    if (res$accept > min_acceptance) break()
+    scale = scale / 2
+    res = metrop(res,nbatch=10^4,scale=scale)
+  }
+  
+  # perform the final MCMC chain which, 
+  # in expectation, contains the desired number of distinct samples
+  res = metrop(res,nbatch=round(distinct_samples/res$accept),scale=scale)
+  
+  # return the final result
+  return(res)
   
 }
 
@@ -335,7 +442,7 @@ plotGene = function(gene,timepoints,rawdata,results_table){
 }
 
 ### Plot an MCMC sample of a measurement time series
-plotMCMC = function(gene,timepoints,rawdata,results_table,distinct_samples=10^4){
+plotMCMC_1d = function(gene,timepoints,rawdata,results_table,distinct_samples=10^4){
   
   total_nuc = rawdata$tot_nu[gene,]
   ratio_nuc = rawdata$ratio_nu[gene,]
@@ -346,45 +453,113 @@ plotMCMC = function(gene,timepoints,rawdata,results_table,distinct_samples=10^4)
   estimates = c(results_table[gene,c("deg_nuc","deg_cyt")])
   
   # Obtain an MCMC sample of desired size, starting at the estimated values
-  res = doMCMC(timepoints=timepoints,
-               deg_nuc=estimates[1],
-               deg_cyt=estimates[2],
+  res_nuc = doMCMC_nuc(timepoints=timepoints,
+                       transformed_nuc=transformed_nuc,
+                       total_nuc=total_nuc,
+                       distinct_samples = distinct_samples,
+                       start_param = estimates[1])
+  
+  res_cyt = doMCMC_cyt(timepoints=timepoints,
+                       deg_nuc = estimates[1],
+                       transformed_cyt=transformed_cyt,
+                       total_cyt=total_cyt,  
+                       distinct_samples = distinct_samples,
+                       start_param = estimates[2])
+  
+  # Histograms of the MCMC sample
+  res_nuc <- data.frame(matrix(log(2)/res_nuc$batch, ncol=1))
+  res_cyt <- data.frame(matrix(log(2)/res_cyt$batch, ncol=1))
+  
+  hist_nuc <- ggplot(data=res_nuc) + 
+    geom_density(aes(x=res_nuc[, 1]), colour="black", fill="grey85") + 
+    theme_minimal() + xlab("nuclear half life")
+  hist_cyt <- ggplot(data=res_cyt) + 
+    geom_density(aes(x=res_cyt[, 1]), colour="black", fill="grey85") + 
+    theme_minimal() + xlab("cytosolic half life")
+  
+  return(list(hist_nuc, hist_cyt))
+}
+
+plotMCMC_2d = function(gene,timepoints,rawdata,results_table,outfile_prefix,distinct_samples=10^4){
+  
+  total_nuc = rawdata$tot_nu[gene,]
+  ratio_nuc = rawdata$ratio_nu[gene,]
+  transformed_nuc = asin(sqrt(ratio_nuc))
+  total_cyt = rawdata$tot_cy[gene,]
+  ratio_cyt = rawdata$ratio_cy[gene,]
+  transformed_cyt = asin(sqrt(ratio_cyt))
+  start_params = c(results_table[gene,c("deg_nuc","deg_cyt")])
+  
+  # Obtain an MCMC sample of desired size, starting at the ML estimate
+  res = doMCMC_2d(timepoints=timepoints,
                transformed_nuc=transformed_nuc,
                transformed_cyt=transformed_cyt,
                total_nuc=total_nuc,
                total_cyt=total_cyt,  
                distinct_samples = distinct_samples,
-               start_params = estimates)
+               start_params = start_params)
   
-  # Histograms of the MCMC sample
-  res_nuc <- data.frame(matrix(log(2)/res[[1]]$batch, ncol=1))
-  res_cyt <- data.frame(matrix(log(2)/res[[2]]$batch, ncol=1))
+  xcoord = log(2)/res$batch[,1]
+  ycoord = log(2)/res$batch[,2]
+  xcoord_df = data.frame(matrix(xcoord, ncol=1))
+  ycoord_df = data.frame(matrix(ycoord, ncol=1))
+  #xfromto = quantile(xcoord,probs=c(0.01,0.99))
+  #yfromto = quantile(ycoord,probs=c(0.01,0.99))
+  xfromto=c(51,59)
+  yfromto=c(36,52)
   
-  hist_nuc <- ggplot(data=res_nuc) + 
-    geom_histogram(aes(x=res_nuc[, 1]), bins=50, colour="black", fill="lightblue") + 
-    theme_minimal() + scale_x_log10() + xlab("nuclear half life")
-  hist_cyt <- ggplot(data=res_cyt) + 
-    geom_histogram(aes(x=res_cyt[, 1]), bins=50, colour="black", fill="lightblue") + 
-    theme_minimal() + scale_x_log10() + xlab("cytosolic half life")
+  # Heatscatterplot of the MCMC sample
+  pdf(paste(outfile_prefix, "2d.pdf", sep="_"), useDingbats = FALSE)
+  heatscatter(x=xcoord,y=ycoord,
+              xlim = xfromto,
+              ylim = yfromto,
+              xlab="nuclear half life",ylab="cytosolic half life",main=gene, colpal = "matlablike")
+  abline(v=results_table[gene,"half_life_nuc"])
+  abline(h=results_table[gene,"half_life_cyt"])
+  points(results_table[gene,"half_life_nuc"], results_table[gene,"half_life_cyt"], pch=19)
   
-  return(list(hist_nuc, hist_cyt))
+  #points(results_table[gene,"half_life_nuc"],results_table[gene,"half_life_cyt"],pch=19,col="green")
+  
+  # Add a countour plot to the central part of the heatscatterplot
+  x_grid = seq(from=xfromto[1],to=xfromto[2],length=250)
+  y_grid = seq(from=yfromto[1],to=yfromto[2],length=250)
+  z_grid = t(sapply(x_grid,function(x){sapply(y_grid,function(y){
+    negloss(log(2)/c(x,y),timepoints,transformed_nuc,total_nuc,transformed_cyt,total_cyt)
+  })}))
+  contour(x_grid, y_grid, z_grid, nlevels=30,add=T,col="#606060")
+  dev.off()
+  
+  # Density plots for nuclear and cytosolic half lifes
+  p_nuc <- ggplot() + 
+    ggtitle(gene) +
+    geom_density(data=xcoord_df, aes(x=xcoord_df[, 1]), colour="black", fill="grey85") + 
+    geom_vline(xintercept = results_table[gene,"half_life_nuc"]) +
+    theme_minimal() + xlab("nuclear half life [min]") + scale_x_continuous(limits=c(51,59), breaks=c(52,54,56,58)) +
+    theme(axis.title=element_text(size=12), axis.text=element_text(size=12),
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+  p_cyt <- ggplot(data=ycoord_df) + 
+    ggtitle(gene) +
+    geom_density(data=xcoord_df, aes(x=ycoord_df[, 1]), colour="black", fill="grey85") + 
+    geom_vline(xintercept = results_table[gene,"half_life_cyt"]) +
+    theme_minimal() + xlab("cytosolic half life [min]") + scale_x_continuous(limits=c(36,52), breaks=c(40,45,50)) +
+    theme(axis.title=element_text(size=12), axis.text=element_text(size=12),
+          panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+  pdf(paste(outfile_prefix, "1d_nuc.pdf", sep="_"), useDingbats = FALSE)
+  print(p_nuc)
+  dev.off()
+  pdf(paste(outfile_prefix, "1d_cyt.pdf", sep="_"), useDingbats = FALSE)
+  print(p_cyt)
+  dev.off()
+  
+  return(list(p_nuc, p_cyt))
 }
+
 
 ############
 ### MAIN ###
 ############
 
-# load the library for Metropolis-Hastings sampling
-library(mcmc)
-# load the library for ggplot
-library(ggplot2)
-# load the library for DEoptim
-library(DEoptim)
-# load the libraries for parallelization
-library(foreach)
-library(doParallel)
-
-# load the processed data
+# load the data
 workdir = "~"
 setwd(workdir)
 
@@ -406,18 +581,13 @@ genes2 = setdiff(genes2, common_genes)
 # define time points at which the samples were taken
 measurement_timepoints = c(15, 30, 45, 60, 90, 120, 180)
 # calculate the effective time points, due to a delay in 4sU labeling
-delay1 = 10.27 # this parameter was obtained from preliminary experiment
-delay2 = 10.90
+delay1 = 10.27
+delay2 = 10.91
 timepoints1 = measurement_timepoints - delay1
 timepoints2 = measurement_timepoints - delay2
 
-# # for now, reduce the number of inspected genes for the sake of time
-# common_genes = sample(common_genes,5)
-# genes1 = sample(genes1, 1)
-# genes2 = sample(genes2, 1)
-
 # preparing parallelization
-n_cores = 6
+n_cores = 1
 parallel_clusters <- makePSOCKcluster(n_cores, outfile="")
 registerDoParallel(parallel_clusters)
 
@@ -427,8 +597,8 @@ results_both <- foreach(j = 1:length(common_genes), .packages=c("mcmc", "LSD", "
                           gene = common_genes[j]
                           if (j %% 10 == 0) cat(j," , ")
                           # fits
-                          r1 <- fitGene(gene,timepoints1,rawdata_s1_nonUTRreads_clean,distinct_samples=10^4,include_samples=T)
-                          r2 <- fitGene(gene,timepoints2,rawdata_s2_nonUTRreads_clean,distinct_samples=10^4,include_samples=T)
+                          r1 <- fitGene(gene,timepoints1,rawdata_s1,distinct_samples=10^4,include_samples=T)
+                          r2 <- fitGene(gene,timepoints2,rawdata_s2,distinct_samples=10^4,include_samples=T)
                           print
                           # cumulative function for MCMC samples
                           cumf1_nuc <- ecdf(r1$samples_nuc)
@@ -464,7 +634,7 @@ results1 <- foreach(j = 1:length(genes1), .packages=c("mcmc", "LSD", "DEoptim"),
                     .export = c("fitGene"), .verbose=TRUE) %dopar% {
                       gene = genes1[j]
                       if (j %% 10 == 0) cat(j," , ")
-                      r1 <- fitGene(gene,timepoints1,rawdata_s1_nonUTRreads_clean,distinct_samples=10^4)
+                      r1 <- fitGene(gene,timepoints1,rawdata_s1,distinct_samples=10^4)
                       r1$within_quant = c("nuc_quant"=NA, "cyt_quant"=NA)
                       r1$between_quant = c("2in1_nuc_quant"=NA, "2in1_cyt_quant"=NA)
                       return(r1)
@@ -477,7 +647,7 @@ results2 <- foreach(j = 1:length(genes2), .packages=c("mcmc", "LSD", "DEoptim"),
                     .export = c("fitGene", "fitTimeseries"), .verbose=TRUE) %dopar% {
                       gene = genes2[j]
                       if (j %% 10 == 0) cat(j," , ")
-                      r2 <- fitGene(gene,timepoints2,rawdata_s2_nonUTRreads_clean,distinct_samples=10^4)
+                      r2 <- fitGene(gene,timepoints2,rawdata_s2,distinct_samples=10^4)
                       r2$within_quant = c("nuc_quant"=NA, "cyt_quant"=NA)
                       r2$between_quant = c("1in2_nuc_quant"=NA, "1in2_cyt_quant"=NA)
                       return(r2)
@@ -537,16 +707,14 @@ for (j in 1:length(results2)){
 }
 rownames(results2_table) = c(common_genes, genes2)
 
-
 # Save the results
 save(results1,results2,results_both,results1_table,results2_table,file = "Estimation_results.RData")
 
-
 cat("Done.")
-
-gene = common_genes[1]
-plotGene(gene,timepoints1,rawdata_s1_nonUTRreads_clean,results1_table)
-plotMCMC(gene,timepoints,rawdata_s1_nonUTRreads_clean,results1_table)
+ 
+# gene = common_genes[1]
+# plotGene(gene,timepoints1,rawdata_s1_nonUTRreads_clean,results1_table)
+# plotMCMC(gene,timepoints,rawdata_s1_nonUTRreads_clean,results1_table)
 
 # plot(results1_table[,"mean_coverage_nuc"],results2_table[,"mean_coverage_nuc"],main="mean coverage",pch=19,cex=0.5)
 # plot(results1_table[,"ML_halflife_nuc"],results2_table[,"ML_halflife_nuc"],pch=19,cex=0.5,

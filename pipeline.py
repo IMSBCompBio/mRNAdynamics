@@ -1,10 +1,5 @@
-"""
-Description
-"""
 
 __author__ = "Katharina Moos"
-__version__ = "0.1.2"
-__date__ = "13/03/2018"
 
 import gzip
 import gc
